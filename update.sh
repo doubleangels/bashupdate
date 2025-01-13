@@ -2,7 +2,7 @@
 #
 # A simple update & maintenance script for Raspberry Pi (or Debian-based systems).
 # Usage:
-#   ./update-script.sh [-v]
+#   ./update.sh [-v]
 #
 # Options:
 #   -v    Enable verbose output (set -x).
