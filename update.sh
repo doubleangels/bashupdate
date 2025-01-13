@@ -1,129 +1,242 @@
-#!/bin/bash -e
+#!/usr/bin/env bash
+#
+# A simple update & maintenance script for Raspberry Pi (or Debian-based systems).
+# Usage:
+#   ./update-script.sh [-v]
+#
+# Options:
+#   -v    Enable verbose output (set -x).
 
-hostname=$(hostname)
-updates_summary=""
+# --------------------------------------------------
+# Enable unofficial bash "strict mode":
+# - e : Exit immediately if a command exits with a non-zero status
+# - u : Treat unset variables as an error
+# - o pipefail : Pipeline returns the exit status of the last command that had a non-zero exit code
+# --------------------------------------------------
+set -euo pipefail
 
-# Parse options for verbose mode
-verbose=false
-while getopts "v" opt; do
-    case ${opt} in
-        v ) verbose=true ;;
-    esac
-done
+# --------------------------------------------------
+# Globals
+# --------------------------------------------------
+SCRIPT_NAME="$(basename "$0")"
+HOSTNAME="$(hostname)"
+UPDATES_SUMMARY=""
+VERBOSE=false
 
-# Enable verbose mode if specified
-if $verbose; then set -x; fi
+# (1) Locking Mechanism
+LOCK_FILE="/tmp/${SCRIPT_NAME}.lock"
 
-# Check if the script is not running as sudo
-if [ "$EUID" -ne 0 ]; then
-    echo "This script requires sudo privileges. Please enter your password to continue."
-    exec sudo "$0" "$@"
-    exit
-fi
+# --------------------------------------------------
+# Functions
+# --------------------------------------------------
 
-# Function to update package information
+function print_section() {
+    echo -e "\n\e[1;33m${1}\e[0m"
+}
+
+function append_summary() {
+    UPDATES_SUMMARY+="\n- ${1}"
+}
+
+# (4) Validate Dependencies
+function check_dependencies() {
+    # Add any commands you consider essential
+    local required_commands=("apt" "grep" "df" "bash")
+
+    for cmd in "${required_commands[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            echo -e "\n\e[1;31mError: '$cmd' is not installed or not in PATH. Please install it and re-run.\e[0m"
+            exit 1
+        fi
+    done
+}
+
+# (2) Disk Space Check
+function check_disk_space() {
+    # Adjust the required space as desired (in 1K-blocks or MB).
+    # df --output=avail returns 1K-blocks by default, so 512000 for 512MB, etc.
+    local required_kb=512000  # ~512MB
+    local available_kb
+
+    available_kb="$(df --output=avail / | tail -n1)"
+    if (( available_kb < required_kb )); then
+        echo -e "\n\e[1;31mInsufficient disk space available (less than ~512MB). Exiting.\e[0m"
+        exit 1
+    fi
+}
+
+# --------------------------------------------------
+# Update system package lists
+# --------------------------------------------------
 function update_packages() {
-    echo -e "\n\e[1;33mUpdating package information...\e[0m"
-    if sudo apt update; then
-        updates_summary+="\n- Package information updated."
+    print_section "Updating package information..."
+    if apt update; then
+        append_summary "Package information updated."
     else
-        updates_summary+="\n- Package information update failed."
+        append_summary "Package information update failed."
     fi
 }
 
-# Function to perform a full upgrade
+# --------------------------------------------------
+# Perform a full upgrade
+# --------------------------------------------------
 function full_upgrade() {
-    echo -e "\n\e[1;33mPerforming a full upgrade of installed packages...\e[0m"
-    if sudo apt full-upgrade; then
-        updates_summary+="\n- Full upgrade of installed packages performed."
+    print_section "Performing a full upgrade of installed packages..."
+    if apt full-upgrade -y; then
+        append_summary "Full upgrade of installed packages performed."
     else
-        updates_summary+="\n- Full upgrade failed."
+        append_summary "Full upgrade failed."
     fi
 }
 
-# Function to remove unnecessary packages
+# --------------------------------------------------
+# Remove unnecessary packages
+# --------------------------------------------------
 function autoremove_packages() {
-    echo -e "\n\e[1;33mRemoving unnecessary packages...\e[0m"
-    if sudo apt autoremove; then
-        updates_summary+="\n- Unnecessary packages removed."
+    print_section "Removing unnecessary packages..."
+    if apt autoremove -y; then
+        append_summary "Unnecessary packages removed."
     else
-        updates_summary+="\n- Autoremove failed."
+        append_summary "Autoremove failed."
     fi
 }
 
-# Function to upgrade Raspberry Pi firmware
+# --------------------------------------------------
+# Upgrade Raspberry Pi firmware (rpi-update)
+# --------------------------------------------------
 function upgrade_firmware() {
-    echo -e "\n\e[1;33mUpgrading firmware...\e[0m"
+    print_section "Upgrading firmware..."
+
     if ! command -v rpi-update &>/dev/null; then
-        echo -e "\n\e[1;33mrpi-update is not installed, installing it...\e[0m"
-        sudo apt-get update
-        sudo apt-get install rpi-update -y
+        print_section "rpi-update is not installed, installing it..."
+        apt update
+        apt install -y rpi-update
+        append_summary "rpi-update installed."
     fi
-    read -p "Do you want to run firmware update (rpi-update)? [y/N]: " run_rpi_update
-    if [[ $run_rpi_update =~ ^[Yy]$ ]]; then
-        sudo rpi-update
-        updates_summary+="\n- Firmware upgraded using rpi-update."
+
+    read -rp "Do you want to run firmware update (rpi-update)? [y/N]: " run_rpi_update
+    if [[ "${run_rpi_update}" =~ ^[Yy]$ ]]; then
+        rpi-update
+        append_summary "Firmware upgraded using rpi-update."
     else
-        updates_summary+="\n- Firmware upgrade skipped."
+        append_summary "Firmware upgrade skipped."
     fi
 }
 
-# Function to handle Docker maintenance
+# --------------------------------------------------
+# Handle Docker maintenance
+# --------------------------------------------------
 function docker_maintenance() {
     if command -v docker &>/dev/null; then
-        if [ -f "dockcheck.sh" ]; then
-            echo -e "\n\e[1;33mRunning dockcheck.sh script with options to update stopped containers and restart stacks...\e[0m"
-            sudo bash dockcheck.sh -apfs
-            updates_summary+="\n- Ran dockcheck.sh script."
+        if [[ -f "./dockcheck.sh" ]]; then
+            print_section "Running dockcheck.sh (updating stopped containers and restarting stacks)..."
+            bash ./dockcheck.sh -apfs
+            append_summary "Ran dockcheck.sh script."
         else
-            echo -e "\n\e[1;31mDockcheck.sh script not found. Attempting to download from the internet.\e[0m"
+            echo -e "\n\e[1;31m'dockcheck.sh' not found locally. Attempting download from the internet.\e[0m"
             if command -v curl &>/dev/null; then
-                curl -o dockcheck.sh https://raw.githubusercontent.com/mag37/dockcheck/main/dockcheck.sh
-                if [ -f "dockcheck.sh" ]; then
+                curl -o dockcheck.sh \
+                    https://raw.githubusercontent.com/mag37/dockcheck/main/dockcheck.sh
+                if [[ -f "dockcheck.sh" ]]; then
                     chmod +x dockcheck.sh
-                    echo -e "\n\e[1;33mDockcheck.sh downloaded successfully. Running the script...\e[0m"
-                    sudo bash dockcheck.sh -apfs
-                    updates_summary+="\n- Downloaded and ran dockcheck.sh script."
+                    print_section "Dockcheck.sh downloaded. Running it now..."
+                    bash ./dockcheck.sh -apfs
+                    append_summary "Downloaded and ran dockcheck.sh script."
                 else
                     echo -e "\n\e[1;31mFailed to download dockcheck.sh. Skipping Docker maintenance.\e[0m"
                 fi
             else
-                echo -e "\n\e[1;31mCurl is not installed. Skipping Docker maintenance.\e[0m"
+                echo -e "\n\e[1;31mcurl is not installed. Skipping Docker maintenance.\e[0m"
             fi
         fi
-        
-        # Automatically perform Docker prune with -fa arguments
-        echo -e "\n\e[1;33mRemoving all unused Docker containers, networks, images, and volumes (forcing prune)...\e[0m"
-        sudo docker system prune -fa
-        updates_summary+="\n- Removed all unused Docker containers, networks, images, and volumes with force."
+
+        # Automatically prune Docker resources
+        print_section "Removing all unused Docker containers, networks, images, and volumes (forced prune)..."
+        docker system prune -fa
+        append_summary "Removed all unused Docker containers, networks, images, and volumes (force)."
     fi
 }
 
-# Call functions to execute update tasks
+# --------------------------------------------------
+# Main
+# --------------------------------------------------
+
+# (1) Locking Mechanism - create lock file to prevent multiple instances
+if [[ -f "$LOCK_FILE" ]]; then
+    echo -e "\n\e[1;31mERROR: Another instance of '$SCRIPT_NAME' is already running. Exiting.\e[0m"
+    exit 1
+fi
+touch "$LOCK_FILE"
+
+# (3) Error Handling / Traps
+# On exit (clean or error), remove the lock file
+trap 'rm -f "$LOCK_FILE"' EXIT
+# On SIGINT (Ctrl+C) or SIGTERM, remove the lock file and exit
+trap 'echo -e "\nCaught signal, cleaning up..."; rm -f "$LOCK_FILE"; exit 1' INT TERM
+
+# Parse command line options
+while getopts "v" opt; do
+    case "${opt}" in
+        v) VERBOSE=true ;;
+        *) ;;
+    esac
+done
+
+# Enable verbose mode if specified
+if ${VERBOSE}; then
+    set -x
+fi
+
+# Ensure script is run as root (or via sudo)
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "This script requires sudo/root privileges. Attempting to re-run as sudo..."
+    exec sudo bash "$0" "$@"
+    echo "Unable to escalate privileges. Exiting."
+    exit 1
+fi
+
+# (4) Validate Dependencies
+check_dependencies
+
+# (2) Disk Space Check
+check_disk_space
+
+# 1) Update/upgrade/autoremove
 update_packages
 full_upgrade
 autoremove_packages
 
-# Run Raspberry Pi-specific updates if applicable
+# 2) If this is a Raspberry Pi, do Pi-specific tasks
 if grep -q "Raspberry Pi" /proc/cpuinfo; then
     upgrade_firmware
-    echo -e "\n\e[1;33mGiving execute permissions and running unifi-update.sh...\e[0m"
-    chmod +x /home/doubleangels/unifi-update.sh
-    bash /home/doubleangels/unifi-update.sh
-    updates_summary+="\n- Executed unifi-update.sh script."
-fi
-
-# Run Docker maintenance if Docker is installed
-docker_maintenance
-
-# Prompt for reboot if required
-if [ -f /var/run/reboot-required ]; then
-    echo -e "\n\e[1;31mA system reboot is required to complete updates. Reboot now? [y/N]: \e[0m"
-    read -r reboot_now
-    if [[ $reboot_now =~ ^[Yy]$ ]]; then
-        sudo reboot
+    # Prompt to run unifi-update.sh
+    read -rp "Do you want to run the unifi-update.sh script? [y/N]: " run_unifi
+    if [[ "${run_unifi}" =~ ^[Yy]$ ]]; then
+        if [[ -f "/home/doubleangels/unifi-update.sh" ]]; then
+            print_section "Running unifi-update.sh..."
+            chmod +x /home/doubleangels/unifi-update.sh
+            bash /home/doubleangels/unifi-update.sh
+            append_summary "Executed unifi-update.sh script."
+        else
+            echo -e "\n\e[1;31m'/home/doubleangels/unifi-update.sh' not found. Skipped.\e[0m"
+        fi
+    else
+        append_summary "unifi-update.sh script skipped."
     fi
 fi
 
-# Summary of updates
-echo -e "\n\e[1;33mUpdates Summary:$updates_summary\e[0m\n"
+# 3) If Docker is installed, run Docker maintenance
+docker_maintenance
+
+# 4) Check if a reboot is required
+if [[ -f /var/run/reboot-required ]]; then
+    echo -e "\n\e[1;31mA system reboot is required to complete updates. Reboot now? [y/N]: \e[0m"
+    read -r reboot_now
+    if [[ "${reboot_now}" =~ ^[Yy]$ ]]; then
+        reboot
+    fi
+fi
+
+# 5) Print summary
+print_section "Updates Summary:"
+echo -e "${UPDATES_SUMMARY}\n"
