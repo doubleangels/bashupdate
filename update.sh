@@ -23,9 +23,6 @@ HOSTNAME="$(hostname)"
 UPDATES_SUMMARY=""
 VERBOSE=false
 
-# (1) Locking Mechanism
-LOCK_FILE="/tmp/${SCRIPT_NAME}.lock"
-
 # --------------------------------------------------
 # Functions
 # --------------------------------------------------
@@ -160,19 +157,6 @@ function docker_maintenance() {
 # --------------------------------------------------
 # Main
 # --------------------------------------------------
-
-# (1) Locking Mechanism - create lock file to prevent multiple instances
-if [[ -f "$LOCK_FILE" ]]; then
-    echo -e "\n\e[1;31mERROR: Another instance of '$SCRIPT_NAME' is already running. Exiting.\e[0m"
-    exit 1
-fi
-touch "$LOCK_FILE"
-
-# (3) Error Handling / Traps
-# On exit (clean or error), remove the lock file
-trap 'rm -f "$LOCK_FILE"' EXIT
-# On SIGINT (Ctrl+C) or SIGTERM, remove the lock file and exit
-trap 'echo -e "\nCaught signal, cleaning up..."; rm -f "$LOCK_FILE"; exit 1' INT TERM
 
 # Parse command line options
 while getopts "v" opt; do
