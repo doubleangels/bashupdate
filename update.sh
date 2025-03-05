@@ -137,7 +137,7 @@ function docker_maintenance() {
                 if [[ -f "dockcheck.sh" ]]; then
                     chmod +x dockcheck.sh
                     print_section "Dockcheck.sh downloaded. Running it now..."
-                    bash ./dockcheck.sh -apfs
+                    bash ./dockcheck.sh -apfs -x 4
                     append_summary "Downloaded and ran dockcheck.sh script."
                 else
                     echo -e "\n\e[1;31mFailed to download dockcheck.sh. Skipping Docker maintenance.\e[0m"
