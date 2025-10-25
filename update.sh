@@ -11,6 +11,12 @@
 # --------------------------------------------------
 set -euo pipefail
 
+# Check for sudo/root privileges
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "This script requires root privileges. Attempting to re-run with sudo..."
+    exec sudo bash "$0" "$@"
+fi
+
 # --------------------------------------------------
 # Globals
 # --------------------------------------------------
