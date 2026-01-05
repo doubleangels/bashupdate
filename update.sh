@@ -309,15 +309,13 @@ function docker_maintenance() {
         else
             print_error "dockcheck.sh file not found after download"
             append_summary "Docker maintenance failed (file not found)"
-            return 1
         fi
     else
         print_error "Failed to download dockcheck.sh from GitHub"
         append_summary "Docker maintenance failed (download failed)"
-        return 1
     fi
     
-    # Comprehensive Docker cleanup - purge all unused resources
+    # Comprehensive Docker cleanup - purge all unused resources (always runs)
     print_info "Performing comprehensive Docker cleanup"
     
     # Remove all unused containers
