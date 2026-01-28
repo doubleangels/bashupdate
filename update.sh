@@ -11,449 +11,275 @@
 # --------------------------------------------------
 set -euo pipefail
 
-# Check for sudo/root privileges
-if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo "This script requires root privileges. Attempting to re-run with sudo..."
-    exec sudo bash "$0" "$@"
-fi
+# --------------------------------------------------
+# Config (override via env vars if desired)
+# --------------------------------------------------
+: "${LOG_DIR:=/var/log/update-script}"
+: "${LOG_FILE:=$LOG_DIR/update.log}"
+: "${REQUIRED_DISK_KB:=1048576}"       # 1GB
+: "${JOURNAL_VACUUM_TIME:=7d}"         # journald vacuum retention
+: "${RUN_DOCKCHECK:=1}"                # 1=run dockcheck if docker installed
+: "${DOCKCHECK_REF:=main}"             # branch/tag for dockcheck script
+: "${DOCKCHECK_OPTS:=-apfs}"           # dockcheck options
 
 # --------------------------------------------------
 # Globals
 # --------------------------------------------------
 SCRIPT_NAME="$(basename "$0")"
 HOSTNAME="$(hostname)"
-UPDATES_SUMMARY=""
-LOG_FILE="/var/log/update_script.log"
-START_TIME=$(date +%s)
+START_TIME="$(date +%s)"
+TMPDIR_CLEANUP=""
+
+# --------------------------------------------------
+# Early privilege escalation (before touching /var/log)
+# --------------------------------------------------
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "Requires root. Re-running with sudo."
+  exec sudo -E bash "$0" "$@"
+fi
+
+# --------------------------------------------------
+# Ensure log path exists, then tee all output to log
+# --------------------------------------------------
+install -d -m 0755 "$LOG_DIR"
+touch "$LOG_FILE"
+chmod 0644 "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 # --------------------------------------------------
 # Utility Functions
 # --------------------------------------------------
-
-function print_section() {
-    echo -e "\n\e[1;34m===============================================================\e[0m"
-    echo -e "\e[1;34m\e[1;37m ${1} \e[0m\e[1;34m\e[0m"
-    echo -e "\e[1;34m===============================================================\e[0m"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - ${1}" >> "$LOG_FILE"
+print_section() {
+  echo -e "\e[1;34m${1}\e[0m"
 }
 
-function print_info() {
-    echo -e "  \e[1;32m▶\e[0m \e[1;37m${1}\e[0m"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - [INFO] ${1}" >> "$LOG_FILE"
+print_info()    { echo -e "\e[1;32m▶\e[0m ${1}"; }
+print_warning() { echo -e "\e[1;33m⚠\e[0m ${1}"; }
+print_error()   { echo -e "\e[1;31m✗\e[0m ${1}"; }
+
+have_cmd() { command -v "$1" &>/dev/null; }
+
+# --------------------------------------------------
+# Trap handlers
+# --------------------------------------------------
+cleanup_tmp() {
+  if [[ -n "${TMPDIR_CLEANUP:-}" && -d "${TMPDIR_CLEANUP:-}" ]]; then
+    rm -rf "$TMPDIR_CLEANUP" || true
+  fi
 }
 
-function print_warning() {
-    echo -e "  \e[1;33m⚠\e[0m \e[1;33m${1}\e[0m"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - [WARNING] ${1}" >> "$LOG_FILE"
+on_err() {
+  local exit_code=$?
+  print_error "Script failed with exit code $exit_code at line ${BASH_LINENO[0]} while running ${BASH_COMMAND}."
+  cleanup_tmp
+  exit "$exit_code"
 }
 
-function print_error() {
-    echo -e "  \e[1;31m✗\e[0m \e[1;31m${1}\e[0m"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - [ERROR] ${1}" >> "$LOG_FILE"
+on_exit() {
+  cleanup_tmp
+  # Reboot prompt if needed
+  if [[ -f /var/run/reboot-required ]]; then
+    echo -e "\n\e[1;33mReboot required. Reboot now? [y/N]:\e[0m "
+    read -r reboot_now || reboot_now="N"
+    if [[ "${reboot_now}" =~ ^[Yy]$ ]]; then
+      print_info "Rebooting."
+      reboot
+    fi
+  fi
 }
 
-function append_summary() {
-    UPDATES_SUMMARY+="\n- ${1}"
-}
-
-function log_command() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - Executing: $*" >> "$LOG_FILE"
-}
+trap on_err ERR
+trap on_exit EXIT
 
 # --------------------------------------------------
 # Prerequisites and Validation
 # --------------------------------------------------
-
-function check_root_privileges() {
-    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-        print_error "This script requires root privileges. Please run with sudo."
-        exit 1
-    fi
+check_root_privileges() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    print_error "Root privileges required."
+    exit 1
+  fi
 }
 
-function check_disk_space() {
-    local required_kb=1048576  # 1GB
-    local available_kb
-    local formatted_size
-    
-    available_kb="$(df --output=avail / | tail -n1)"
-    if (( available_kb < required_kb )); then
-        print_error "Insufficient disk space available (less than 1GB). Exiting."
-        exit 1
+check_dependencies() {
+  local required_commands=("apt-get" "dpkg" "grep" "awk" "df" "find")
+  for cmd in "${required_commands[@]}"; do
+    if ! have_cmd "$cmd"; then
+      print_error "Required command '$cmd' is not available."
+      return 1
     fi
-    
-    # Format the available space in GB or MB
-    if (( available_kb >= 1048576 )); then
-        # Convert to GB
-        local available_gb=$((available_kb / 1048576))
-        local remaining_mb=$(((available_kb % 1048576) / 1024))
-        if (( remaining_mb > 0 )); then
-            formatted_size="${available_gb}.${remaining_mb}GB"
-        else
-            formatted_size="${available_gb}GB"
-        fi
-    else
-        # Convert to MB
-        local available_mb=$((available_kb / 1024))
-        formatted_size="${available_mb}MB"
-    fi
-    
-    print_info "Disk space check passed (${formatted_size} available)"
+  done
 }
 
-function check_dependencies() {
-    local required_commands=("apt" "dpkg" "grep" "awk")
-    
-    for cmd in "${required_commands[@]}"; do
-        if ! command -v "$cmd" &>/dev/null; then
-            print_error "Required command '$cmd' is not available."
-            exit 1
-        fi
-    done
-    print_info "All required dependencies are available"
+format_kb_human() {
+  local kb="$1"
+  # Prefer numfmt if available
+  if have_cmd numfmt; then
+    numfmt --to=iec --suffix=B $((kb * 1024))
+    return 0
+  fi
+
+  # Fallback: show "X GB Y MB"
+  if (( kb >= 1048576 )); then
+    local gb=$((kb / 1048576))
+    local mb=$(((kb % 1048576) / 1024))
+    echo "${gb}GB ${mb}MB"
+  else
+    local mb=$((kb / 1024))
+    echo "${mb}MB"
+  fi
+}
+
+check_disk_space() {
+  local available_kb
+  available_kb="$(df --output=avail -k / | tail -n1 | tr -d ' ')"
+
+  if (( available_kb < REQUIRED_DISK_KB )); then
+    print_error "Insufficient disk space. Need $(format_kb_human "$REQUIRED_DISK_KB"), have $(format_kb_human "$available_kb")."
+    exit 1
+  fi
 }
 
 # --------------------------------------------------
 # Package Management Functions
 # --------------------------------------------------
-
-function update_apt_packages() {
-    print_section "Updating APT Package Lists"
-    
-    log_command "apt update"
-    if apt update 2>&1 | tee -a "$LOG_FILE"; then
-        print_info "APT package lists updated successfully"
-        append_summary "APT package lists updated"
-    else
-        print_error "Failed to update APT package lists"
-        append_summary "APT update failed"
-        return 1
-    fi
+update_apt_packages() {
+  print_section "Updating package lists!"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
 }
 
-function install_necessary_packages() {
-    print_section "Installing Script Dependencies"
-    
-    # Only install packages that are NOT typically included in Debian base install
-    # but are needed for this script to function
-    local packages=(
-        "curl"             # For downloading dockcheck (not in base Debian)
-    )
-    
-    local installed_count=0
-    local skipped_count=0
-    local failed_count=0
-    
-    for package in "${packages[@]}"; do
-        if dpkg -l | grep -q "^ii.*$package "; then
-            print_info "$package is already installed"
-            skipped_count=$((skipped_count + 1))
-        else
-            print_info "Installing $package"
-            log_command "apt install -y $package"
-            if apt install -y "$package" 2>&1 | tee -a "$LOG_FILE"; then
-                print_info "$package installed successfully"
-                installed_count=$((installed_count + 1))
-            else
-                print_warning "Failed to install $package"
-                failed_count=$((failed_count + 1))
-            fi
-        fi
-    done
-    
-    append_summary "Package installation: $installed_count installed, $skipped_count already present, $failed_count failed"
+is_pkg_installed() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
 }
 
-function upgrade_system() {
-    print_section "Upgrading System Packages"
-    
-    log_command "apt upgrade -y"
-    if apt upgrade -y 2>&1 | tee -a "$LOG_FILE"; then
-        print_info "System upgrade completed successfully"
-        append_summary "System packages upgraded"
-    else
-        print_error "System upgrade failed"
-        append_summary "System upgrade failed"
-        return 1
+install_necessary_packages() {
+  export DEBIAN_FRONTEND=noninteractive
+
+  local packages=("curl")  # needed for dockcheck download
+
+  for package in "${packages[@]}"; do
+    if ! is_pkg_installed "$package"; then
+      if ! apt-get install -y -qq "$package" &>/dev/null; then
+        print_warning "Failed to install $package."
+      fi
     fi
+  done
 }
 
-function autoclean_and_purge() {
-    print_section "Cleaning Up System"
-    
-    # Autoremove unused packages
-    print_info "Removing unused packages"
-    log_command "apt autoremove -y"
-    if apt autoremove -y 2>&1 | tee -a "$LOG_FILE"; then
-        print_info "Unused packages removed"
-        append_summary "Unused packages removed"
-    else
-        print_warning "Failed to remove unused packages"
-    fi
-    
-    # Clean APT cache
-    print_info "Cleaning APT cache"
-    log_command "apt clean"
-    if apt clean 2>&1 | tee -a "$LOG_FILE"; then
-        print_info "APT cache cleaned"
-        append_summary "APT cache cleaned"
-    else
-        print_warning "Failed to clean APT cache"
-    fi
-    
-    # Purge old packages
-    print_info "Purging old packages"
-    log_command "apt autoclean"
-    if apt autoclean 2>&1 | tee -a "$LOG_FILE"; then
-        print_info "Old packages purged"
-        append_summary "Old packages purged"
-    else
-        print_warning "Failed to purge old packages"
-    fi
+
+upgrade_system() {
+  print_section "Upgrading system packages!"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get -y -qq \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" \
+    full-upgrade
+}
+
+autoclean_and_purge() {
+  print_section "Cleaning up unused packages and cache!"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get autoremove -y --purge -qq &>/dev/null
+  apt-get clean -qq &>/dev/null
+  apt-get autoclean -qq &>/dev/null
+}
+
+cleanup_old_kernels() {
+  print_section "Removing old kernel packages."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get autoremove -y --purge -qq &>/dev/null
 }
 
 # --------------------------------------------------
-# System Maintenance
+# Log / Journal Maintenance (SAFE)
 # --------------------------------------------------
-
-function cleanup_old_kernels() {
-    print_section "Cleaning Up Old Kernels"
-    
-    local current_kernel
-    current_kernel=$(uname -r)
-    print_info "Current kernel: $current_kernel"
-    
-    # Remove old kernel packages
-    print_info "Checking for old kernels to remove"
-    log_command "apt autoremove --purge -y"
-    local autoremove_output
-    autoremove_output=$(apt autoremove --purge -y 2>&1)
-    echo "$autoremove_output" | tee -a "$LOG_FILE"
-    
-    if echo "$autoremove_output" | grep -q "0 upgraded, 0 newly installed, 0 to remove"; then
-        print_info "No old kernel packages found to remove"
-        append_summary "No old kernel packages to remove"
-    else
-        print_info "Old kernel packages removed"
-        append_summary "Old kernel packages removed"
+cleanup_logs() {
+  print_section "Cleaning up system logs!"
+  if have_cmd journalctl; then
+    journalctl --vacuum-time="$JOURNAL_VACUUM_TIME" &>/dev/null || true
+  fi
+  if [[ -f "$LOG_FILE" ]]; then
+    local max_lines=20000
+    local cur_lines
+    cur_lines="$(wc -l < "$LOG_FILE" | tr -d ' ')"
+    if (( cur_lines > max_lines )); then
+      tail -n "$max_lines" "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
     fi
-}
-
-function cleanup_logs() {
-    print_section "Cleaning Up Old Log Files"
-    
-    local log_dirs=("/var/log" "/var/log/journal")
-    local removed_count=0
-    
-    for log_dir in "${log_dirs[@]}"; do
-        if [[ -d "$log_dir" ]]; then
-            local count
-            count=$(find "$log_dir" -type f -name "*.log" -mtime +7 -delete -print 2>/dev/null | wc -l)
-            removed_count=$((removed_count + count))
-        fi
-    done
-    
-    if [[ $removed_count -gt 0 ]]; then
-        print_info "Removed $removed_count old log files"
-        append_summary "Removed $removed_count old log files"
-    else
-        print_info "No old log files found"
-        append_summary "No old log files to remove"
-    fi
-}
-
-function docker_maintenance() {
-    print_section "Docker Container Maintenance"
-    
-    # Check if Docker is installed
-    if ! command -v docker &>/dev/null; then
-        print_info "Docker not found. Skipping Docker maintenance."
-        append_summary "Docker maintenance skipped (Docker not installed)"
-        return 0
-    fi
-    
-    # Check if curl is available for downloading dockcheck
-    if ! command -v curl &>/dev/null; then
-        print_warning "curl not available. Installing curl for dockcheck download"
-        if apt install -y curl 2>&1 | tee -a "$LOG_FILE"; then
-            print_info "curl installed successfully"
-        else
-            print_error "Failed to install curl. Skipping Docker maintenance."
-            append_summary "Docker maintenance skipped (curl installation failed)"
-            return 1
-        fi
-    fi
-    
-    # Download latest dockcheck.sh
-    print_info "Downloading latest dockcheck.sh from GitHub"
-    log_command "curl -o dockcheck.sh https://raw.githubusercontent.com/mag37/dockcheck/main/dockcheck.sh"
-    if curl -o dockcheck.sh https://raw.githubusercontent.com/mag37/dockcheck/main/dockcheck.sh 2>&1 | tee -a "$LOG_FILE"; then
-        if [[ -f "dockcheck.sh" ]]; then
-            chmod +x dockcheck.sh
-            print_info "dockcheck.sh downloaded and made executable"
-            
-            # Run dockcheck with options: -a (all), -p (pull), -f (force), -s (restart stacks)
-            print_info "Running dockcheck.sh to update and restart Docker containers"
-            log_command "bash ./dockcheck.sh -apfs"
-            if bash ./dockcheck.sh -apfs 2>&1 | tee -a "$LOG_FILE"; then
-                print_info "Docker containers updated and stacks restarted successfully"
-                append_summary "Docker containers updated and stacks restarted"
-            else
-                print_warning "dockcheck.sh completed with warnings or errors"
-                append_summary "Docker maintenance completed with warnings"
-            fi
-            
-            # Clean up dockcheck.sh file
-            rm -f dockcheck.sh
-            print_info "Cleaned up dockcheck.sh file"
-        else
-            print_error "dockcheck.sh file not found after download"
-            append_summary "Docker maintenance failed (file not found)"
-        fi
-    else
-        print_error "Failed to download dockcheck.sh from GitHub"
-        append_summary "Docker maintenance failed (download failed)"
-    fi
-    
-    # Comprehensive Docker cleanup - purge all unused resources (always runs)
-    print_info "Performing comprehensive Docker cleanup"
-    
-    # Remove all unused containers
-    print_info "Removing unused containers"
-    log_command "docker container prune -f"
-    if docker container prune -f 2>&1 | tee -a "$LOG_FILE" | grep -q "Total reclaimed space: 0B"; then
-        print_info "No unused containers found"
-    else
-        print_info "Unused containers removed"
-    fi
-    sleep 1
-    
-    # Remove all unused volumes
-    print_info "Removing unused volumes"
-    log_command "docker volume prune -f"
-    if docker volume prune -f 2>&1 | tee -a "$LOG_FILE" | grep -q "Total reclaimed space: 0B"; then
-        print_info "No unused volumes found"
-    else
-        print_info "Unused volumes removed"
-    fi
-    sleep 1
-    
-    # Remove all unused networks
-    print_info "Removing unused networks"
-    log_command "docker network prune -f"
-    if docker network prune -f 2>&1 | tee -a "$LOG_FILE" | grep -q "Total reclaimed space: 0B"; then
-        print_info "No unused networks found"
-    else
-        print_info "Unused networks removed"
-    fi
-    sleep 1
-    
-    # Remove all unused images
-    print_info "Removing unused images"
-    log_command "docker image prune -a -f"
-    if docker image prune -a -f 2>&1 | tee -a "$LOG_FILE" | grep -q "Total reclaimed space: 0B"; then
-        print_info "No unused images found"
-    else
-        print_info "Unused images removed"
-    fi
-    sleep 1
-    
-    # Final system prune for any remaining resources
-    print_info "Performing final system cleanup"
-    log_command "docker system prune -a -f --volumes"
-    if docker system prune -a -f --volumes 2>&1 | tee -a "$LOG_FILE" | grep -q "Total reclaimed space: 0B"; then
-        print_info "No additional cleanup needed"
-    else
-        print_info "Additional system cleanup completed"
-    fi
-    
-    print_info "Comprehensive Docker cleanup completed"
-    append_summary "Docker cleanup: containers, volumes, networks, and images checked"
+  fi
 }
 
 # --------------------------------------------------
-# Summary and Reporting
+# Docker Maintenance
 # --------------------------------------------------
-
-function print_summary() {
-    local end_time=$(date +%s)
-    local duration=$((end_time - START_TIME))
-    local duration_formatted=$(printf "%02d:%02d:%02d" $((duration/3600)) $((duration%3600/60)) $((duration%60)))
-    
-    print_section "Update Summary"
-    echo -e "\e[1;34m┌─ Summary of Actions Performed ─────────────────────────────────┐\e[0m"
-    echo -e "${UPDATES_SUMMARY}"
-    echo -e "\e[1;34m└─────────────────────────────────────────────────────────────────┘\e[0m"
-    print_info "Script completed in $duration_formatted"
-    print_info "Full log available at: $LOG_FILE"
-    
-    # Check if reboot is required
-    if [[ -f /var/run/reboot-required ]]; then
-        print_warning "System reboot is required to complete updates"
-        echo -e "\n\e[1;33mDo you want to reboot now? [y/N]: \e[0m"
-        read -r reboot_now
-        if [[ "${reboot_now}" =~ ^[Yy]$ ]]; then
-            print_info "Rebooting system"
-            reboot
-        else
-            print_info "Please reboot manually when convenient"
-        fi
+docker_maintenance() {
+  print_section "Updating Docker containers and cleaning up old images, volumes, and networks!"
+  if ! have_cmd docker; then
+    return 0
+  fi
+  if ! docker info &>/dev/null; then
+    print_warning "Docker daemon is not reachable."
+    return 0
+  fi
+  if (( RUN_DOCKCHECK == 1 )); then
+    if ! have_cmd curl; then
+      apt-get update -qq &>/dev/null
+      apt-get install -y -qq curl &>/dev/null
     fi
+    local dockcheck_dir="/usr/local/lib/update-script"
+    local dockcheck_file="$dockcheck_dir/dockcheck.sh"
+    local dockcheck_url="https://raw.githubusercontent.com/mag37/dockcheck/${DOCKCHECK_REF}/dockcheck.sh"
+    install -d -m 0755 "$dockcheck_dir" 2>/dev/null || true
+    if curl -fsSLo "$dockcheck_file" "$dockcheck_url"; then
+      chmod +x "$dockcheck_file"
+      (cd "$dockcheck_dir" && bash "$dockcheck_file" ${DOCKCHECK_OPTS}) || true
+    fi
+  fi
+  docker image prune -a -f &>/dev/null || true
+  docker volume prune -f &>/dev/null || true
+  docker network prune -f &>/dev/null || true
+  docker system prune -f &>/dev/null || true
+}
+
+# --------------------------------------------------
+# Snap Package Updates
+# --------------------------------------------------
+update_snap_packages() {
+  print_section "Updating snap packages!"
+  if ! have_cmd snap; then
+    return 0
+  fi
+  if ! systemctl is-active --quiet snapd 2>/dev/null; then
+    systemctl start snapd 2>/dev/null || return 0
+  fi
+  snap refresh &>/dev/null || true
 }
 
 # --------------------------------------------------
 # Main Execution
 # --------------------------------------------------
-
-function main() {
-    print_section "Starting System Update Process"
-    print_info "Script: $SCRIPT_NAME"
-    print_info "Host: $HOSTNAME"
-    print_info "Started at: $(date)"
-    
-    # Initialize log file
-    echo "=== Update Script Started at $(date) ===" > "$LOG_FILE"
-    
-    # Run all update functions
-    check_root_privileges
-    check_dependencies
-    check_disk_space
-    
-    update_apt_packages
-    install_necessary_packages
-    upgrade_system
-    autoclean_and_purge
-    cleanup_old_kernels
-    cleanup_logs
-    docker_maintenance
-    
-    # Check if this is a Raspberry Pi and prompt for unifi-update.sh
-    print_section "Checking for Raspberry Pi specific tasks"
-    if grep -q "Raspberry Pi" /proc/cpuinfo; then
-        print_info "Raspberry Pi detected"
-        echo -e "\n\e[1;33mDo you want to run the unifi-update.sh script? [y/N]: \e[0m"
-        read -t 30 -rp "" run_unifi || run_unifi="N"
-        if [[ "${run_unifi}" =~ ^[Yy]$ ]]; then
-            if [[ -f "/home/doubleangels/unifi-update.sh" ]]; then
-                print_info "Running unifi-update.sh"
-                chmod +x /home/doubleangels/unifi-update.sh
-                bash /home/doubleangels/unifi-update.sh
-                append_summary "Executed unifi-update.sh script"
-            else
-                print_warning "unifi-update.sh script not found at /home/doubleangels/unifi-update.sh"
-                append_summary "unifi-update.sh script not found"
-            fi
-        else
-            print_info "unifi-update.sh script skipped"
-            append_summary "unifi-update.sh script skipped"
-        fi
-    else
-        print_info "Not a Raspberry Pi system"
-        append_summary "Pi-specific tasks skipped (not a Raspberry Pi)"
+main() {
+  check_root_privileges
+  check_disk_space
+  check_dependencies
+  update_apt_packages
+  install_necessary_packages
+  upgrade_system
+  update_snap_packages
+  autoclean_and_purge
+  cleanup_old_kernels
+  cleanup_logs
+  docker_maintenance
+  if [[ -r /proc/cpuinfo ]] && grep -q "Raspberry Pi" /proc/cpuinfo; then
+    echo -e "\n\e[1;33mRun unifi-update.sh? [y/N]:\e[0m "
+    read -t 30 -rp "" run_unifi || run_unifi="N"
+    if [[ "${run_unifi}" =~ ^[Yy]$ ]]; then
+      if [[ -f "/home/doubleangels/unifi-update.sh" ]]; then
+        chmod +x /home/doubleangels/unifi-update.sh
+        bash /home/doubleangels/unifi-update.sh
+      fi
     fi
-    
-    print_summary
+  fi
 }
 
-# Execute main function
 main "$@"
