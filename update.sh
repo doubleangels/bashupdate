@@ -145,6 +145,7 @@ check_disk_space() {
 # --------------------------------------------------
 update_apt_packages() {
   print_section "Updating package lists!"
+  echo
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
 }
@@ -170,6 +171,7 @@ install_necessary_packages() {
 
 upgrade_system() {
   print_section "Upgrading system packages!"
+  echo
   export DEBIAN_FRONTEND=noninteractive
   apt-get -y -qq \
     -o Dpkg::Options::="--force-confdef" \
@@ -179,6 +181,7 @@ upgrade_system() {
 
 autoclean_and_purge() {
   print_section "Cleaning up unused packages and cache!"
+  echo
   export DEBIAN_FRONTEND=noninteractive
   apt-get autoremove -y --purge -qq &>/dev/null
   apt-get clean -qq &>/dev/null
@@ -186,7 +189,8 @@ autoclean_and_purge() {
 }
 
 cleanup_old_kernels() {
-  print_section "Removing old kernel packages."
+  print_section "Removing old kernel packages!"
+  echo
   export DEBIAN_FRONTEND=noninteractive
   apt-get autoremove -y --purge -qq &>/dev/null
 }
@@ -196,6 +200,7 @@ cleanup_old_kernels() {
 # --------------------------------------------------
 cleanup_logs() {
   print_section "Cleaning up system logs!"
+  echo
   if have_cmd journalctl; then
     journalctl --vacuum-time="$JOURNAL_VACUUM_TIME" &>/dev/null || true
   fi
@@ -246,6 +251,7 @@ docker_maintenance() {
 # --------------------------------------------------
 update_snap_packages() {
   print_section "Updating snap packages!"
+  echo
   if ! have_cmd snap; then
     return 0
   fi
