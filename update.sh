@@ -144,10 +144,12 @@ check_disk_space() {
 # Package Management Functions
 # --------------------------------------------------
 update_apt_packages() {
+  echo
   print_section "Updating package lists!"
   echo
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
+  apt-get update
+  echo
 }
 
 is_pkg_installed() {
@@ -161,7 +163,7 @@ install_necessary_packages() {
 
   for package in "${packages[@]}"; do
     if ! is_pkg_installed "$package"; then
-      if ! apt-get install -y -qq "$package" &>/dev/null; then
+      if ! apt-get install -y "$package"; then
         print_warning "Failed to install $package."
       fi
     fi
@@ -170,39 +172,46 @@ install_necessary_packages() {
 
 
 upgrade_system() {
+  echo
   print_section "Upgrading system packages!"
   echo
   export DEBIAN_FRONTEND=noninteractive
-  apt-get -y -qq \
+  apt-get -y \
     -o Dpkg::Options::="--force-confdef" \
     -o Dpkg::Options::="--force-confold" \
     full-upgrade
+  echo
 }
 
 autoclean_and_purge() {
+  echo
   print_section "Cleaning up unused packages and cache!"
   echo
   export DEBIAN_FRONTEND=noninteractive
-  apt-get autoremove -y --purge -qq &>/dev/null
-  apt-get clean -qq &>/dev/null
-  apt-get autoclean -qq &>/dev/null
+  apt-get autoremove -y --purge
+  apt-get clean
+  apt-get autoclean
+  echo
 }
 
 cleanup_old_kernels() {
+  echo
   print_section "Removing old kernel packages!"
   echo
   export DEBIAN_FRONTEND=noninteractive
-  apt-get autoremove -y --purge -qq &>/dev/null
+  apt-get autoremove -y --purge
+  echo
 }
 
 # --------------------------------------------------
 # Log / Journal Maintenance (SAFE)
 # --------------------------------------------------
 cleanup_logs() {
+  echo
   print_section "Cleaning up system logs!"
   echo
   if have_cmd journalctl; then
-    journalctl --vacuum-time="$JOURNAL_VACUUM_TIME" &>/dev/null || true
+    journalctl --vacuum-time="$JOURNAL_VACUUM_TIME" || true
   fi
   if [[ -f "$LOG_FILE" ]]; then
     local max_lines=20000
@@ -212,12 +221,14 @@ cleanup_logs() {
       tail -n "$max_lines" "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
     fi
   fi
+  echo
 }
 
 # --------------------------------------------------
 # Docker Maintenance
 # --------------------------------------------------
 docker_maintenance() {
+  echo
   print_section "Updating Docker containers and cleaning up old images, volumes, and networks!"
   if ! have_cmd docker; then
     return 0
@@ -228,8 +239,8 @@ docker_maintenance() {
   fi
   if (( RUN_DOCKCHECK == 1 )); then
     if ! have_cmd curl; then
-      apt-get update -qq &>/dev/null
-      apt-get install -y -qq curl &>/dev/null
+      apt-get update
+      apt-get install -y curl
     fi
     local dockcheck_dir="/usr/local/lib/update-script"
     local dockcheck_file="$dockcheck_dir/dockcheck.sh"
@@ -240,25 +251,25 @@ docker_maintenance() {
       (cd "$dockcheck_dir" && bash "$dockcheck_file" ${DOCKCHECK_OPTS}) || true
     fi
   fi
-  docker image prune -a -f &>/dev/null || true
-  docker volume prune -f &>/dev/null || true
-  docker network prune -f &>/dev/null || true
-  docker system prune -f &>/dev/null || true
+  docker system prune -a -f --volumes
+  echo
 }
 
 # --------------------------------------------------
 # Snap Package Updates
 # --------------------------------------------------
 update_snap_packages() {
-  print_section "Updating snap packages!"
-  echo
   if ! have_cmd snap; then
     return 0
   fi
+  echo
+  print_section "Updating snap packages!"
+  echo
   if ! systemctl is-active --quiet snapd 2>/dev/null; then
     systemctl start snapd 2>/dev/null || return 0
   fi
-  snap refresh &>/dev/null || true
+  snap refresh
+  echo
 }
 
 # --------------------------------------------------
