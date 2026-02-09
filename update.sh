@@ -233,6 +233,8 @@ docker_maintenance() {
   if ! have_cmd docker; then
     return 0
   fi
+  # Use default local daemon; avoid inheriting user's DOCKER_HOST/DOCKER_CONTEXT from sudo -E
+  unset -v DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG
   if ! docker info &>/dev/null; then
     print_warning "Docker daemon is not reachable."
     return 0
